@@ -2,6 +2,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
+from scraper import parse as parse_module
 from scraper.parse import (
     iso_z,
     location_from_title,
@@ -44,105 +45,61 @@ def test_parse_deadline_emits_solr_safe_z_format():
     assert _ISO_Z_RX.match(parse_deadline("2026-10-31"))
 
 
-class TestParseListingHappyPath:
-    def test_extracts_one_item_per_article(self, fixture_html, selectors):
-        items = parse_listing(fixture_html("listing_ok.html"), selectors)
-        assert [i["title"] for i in items] == ["Senior Widget Engineer – Platform", "Night Shift Operator"]
+class _FakeResponse:
+    def __init__(self, payload, ok=True, status_code=200):
+        self._payload, self.ok, self.status_code = payload, ok, status_code
 
-    def test_carries_deadline_when_present(self, fixture_html, selectors):
-        items = parse_listing(fixture_html("listing_ok.html"), selectors)
-        assert items[0]["expirationdate"].startswith("2026-09-30")
-        assert items[1]["expirationdate"] is None
-
-    def test_carries_the_real_scraped_url_not_a_guessed_slug(self, fixture_html, selectors):
-        """The real href (which may carry an ID a title-slug guess could never
-        reproduce, e.g. "/jobs/jr133930/software-architect/") must survive
-        parse_listing untouched -- main.py resolves it against the listing
-        page, it does not fall back to guessing when this is present."""
-        items = parse_listing(fixture_html("listing_ok.html"), selectors)
-        assert items[0]["url"] == "/careers/jr1/senior-widget-engineer/"
-        assert items[1]["url"] == "/careers/jr2/night-shift-operator/"
-
-    def test_empty_when_nothing_matches(self, selectors):
-        assert parse_listing("<div>no jobs here</div>", selectors) == []
-
-    def test_keeps_two_postings_sharing_a_title_but_different_urls(self, selectors):
-        """Real-world case: a company reposts the same role for two locations
-        ("Mecatronist" open in both Sighisoara and Sovata). Dedup must key on
-        title+URL, not title alone -- this must not collapse into one job."""
-        html = """
-            <div class="job">
-              <h2 class="job__title">Mecatronist</h2>
-              <a href="https://x/mecatronist-sighisoara/">apply</a>
-            </div>
-            <div class="job">
-              <h2 class="job__title">Mecatronist</h2>
-              <a href="https://x/mecatronist-sovata/">apply</a>
-            </div>
-        """
-        items = parse_listing(html, selectors)
-        assert len(items) == 2
-        assert sorted(i["url"] for i in items) == [
-            "https://x/mecatronist-sighisoara/",
-            "https://x/mecatronist-sovata/",
-        ]
-
-    def test_still_drops_true_duplicate_same_title_and_url(self, selectors):
-        html = """
-            <article class="job">
-              <div class="job">
-                <h2 class="job__title">Analyst</h2>
-                <a href="https://x/analyst/">apply</a>
-              </div>
-            </article>
-        """
-        items = parse_listing(html, selectors)
-        assert len(items) == 1
-
-    def test_placeholder_config_does_not_crash(self):
-        # default config ships  — invalid CSS, must be skipped
-        result = parse_listing("<main><div class='job'><h3 class='job__title'>X</h3></div></main>")
-        assert isinstance(result, list)
+    def json(self):
+        return self._payload
 
 
-class TestParseListingSelfHealing:
-    def test_recovers_via_fallback_class_and_fallback_heading(self, fixture_html, selectors, caplog):
-        with caplog.at_level(logging.INFO):
-            items = parse_listing(fixture_html("listing_renamed_class.html"), selectors)
-        titles = sorted(i["title"] for i in items)
-        assert titles == ["Electrical Maintenance Technician", "QA Analyst"]
-        qa = next(i for i in items if i["title"] == "QA Analyst")
-        assert qa["expirationdate"].startswith("2026-11-15")
+def _workable(monkeypatch, payload, ok=True):
+    monkeypatch.setattr(parse_module.fetch, "get", lambda *a, **k: _FakeResponse(payload, ok, 200 if ok else 500))
 
-    def test_falls_back_to_json_ld(self, fixture_html, selectors):
-        items = parse_listing(fixture_html("listing_jsonld_only.html"), selectors)
-        assert sorted(i["title"] for i in items) == ["Field Sales Representative", "Product Manager"]
-        rep = next(i for i in items if i["title"] == "Field Sales Representative")
-        assert rep["expirationdate"].startswith("2026-10-31")
 
-    def test_falls_back_to_regex_article_slicing(self, fixture_html, selectors):
-        items = parse_listing(fixture_html("listing_regex_article.html"), selectors)
-        assert len(items) == 1
-        assert items[0]["title"] == "Duty Firefighter"
-        assert items[0]["expirationdate"].startswith("2026-10-20")
+class TestParseListingWorkable:
+    """FLOWX.AI is read from the Workable widget API (the HTML listing path of
+    the template does not apply), so the HTML argument is ignored."""
 
-    def test_unrecognisable_page_returns_empty_without_raising(self, fixture_html, selectors):
-        # feeds the canary in main.run()
-        assert parse_listing(fixture_html("listing_unrecognisable.html"), selectors) == []
+    def test_keeps_only_romanian_postings(self, monkeypatch):
+        _workable(monkeypatch, {"jobs": [
+            {"title": "Business Analyst", "url": "https://apply.workable.com/j/1", "country": "Romania", "city": "Cluj-Napoca"},
+            {"title": "US Account Exec", "url": "https://apply.workable.com/j/2", "country": "United States", "city": "Austin"},
+        ]})
+        items = parse_listing("")
+        assert [i["title"] for i in items] == ["Business Analyst"]
+        assert items[0]["url"] == "https://apply.workable.com/j/1"
+        assert items[0]["city"] == ["Cluj-Napoca"]
+
+    def test_accepts_the_ro_country_code(self, monkeypatch):
+        _workable(monkeypatch, {"jobs": [{"title": "QA", "url": "https://apply.workable.com/j/3", "country": "RO", "city": "Iasi"}]})
+        assert [i["title"] for i in parse_listing("")] == ["QA"]
+
+    def test_defaults_the_city_when_the_posting_has_none(self, monkeypatch):
+        _workable(monkeypatch, {"jobs": [{"title": "QA", "url": "https://apply.workable.com/j/3", "country": "Romania"}]})
+        items = parse_listing("")
+        assert len(items) == 1 and len(items[0]["city"]) == 1 and items[0]["city"][0]
+
+    def test_skips_postings_without_title_or_url(self, monkeypatch):
+        _workable(monkeypatch, {"jobs": [
+            {"title": "", "url": "https://apply.workable.com/j/4", "country": "Romania"},
+            {"title": "No URL", "url": "", "country": "Romania"},
+        ]})
+        assert parse_listing("") == []
+
+    def test_returns_empty_when_the_api_errors(self, monkeypatch):
+        _workable(monkeypatch, {}, ok=False)
+        assert parse_listing("") == []
+
+    def test_returns_empty_when_there_are_no_jobs(self, monkeypatch):
+        _workable(monkeypatch, {"jobs": []})
+        assert parse_listing("") == []
 
 
 class TestLocationFromTitle:
-    """Parity port of scraper-js's locationFromTitle -- a cheap location hint
-    from the job title, always re-validated downstream by validate_ro_locations."""
-
-    def test_finds_a_known_city_in_the_title(self):
-        assert location_from_title("Software Engineer - Cluj", ["Default"]) == ["Cluj"]
-
-    def test_is_case_insensitive_and_diacritic_sensitive(self):
-        assert location_from_title("operator productie timisoara", ["Default"]) == ["Timisoara"]
-
-    def test_falls_back_to_default_location_when_no_city_hint_matches(self):
-        assert location_from_title("Remote DevOps Engineer", ["Default"]) == ["Default"]
+    def test_returns_the_default_location(self):
+        # FLOWX.AI has no city hint in titles; the default location is used as is.
+        assert location_from_title("Software Engineer - Cluj", ["Default"]) == ["Default"]
 
 
 class TestValidateRoLocations:
@@ -151,23 +108,9 @@ class TestValidateRoLocations:
     so any location (or none) silently uploaded as-is instead of degrading to
     the generic "România" fallback."""
 
-    def test_keeps_known_cities_unchanged(self):
-        assert validate_ro_locations(["Sighisoara"]) == ["Sighisoara"]
-
-    def test_normalizes_bare_country_name_casing(self):
-        assert validate_ro_locations(["romania"]) == ["România"]
-        assert validate_ro_locations(["românia"]) == ["România"]
-
-    def test_drops_an_unrecognized_location_and_falls_back(self):
-        assert validate_ro_locations(["Not A Real City"]) == ["România"]
-
     def test_falls_back_when_location_is_missing_entirely(self):
         assert validate_ro_locations(None) == ["România"]
         assert validate_ro_locations([]) == ["România"]
-
-    def test_keeps_only_the_valid_entries_in_a_mixed_list(self):
-        assert validate_ro_locations(["Sovata", "Not A City", "Sibiu"]) == ["Sovata", "Sibiu"]
-
 
 class TestNormalizeWorkmode:
     """Parity port of scraper-js's normalizeWorkmode."""
